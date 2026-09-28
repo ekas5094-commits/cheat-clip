@@ -85,6 +85,14 @@ class VideoAnalysis(BaseModel):
     summary: str = Field(description="1-2 sentence video summary, followed by 2-4 general hashtags (e.g. #podcast #marriage #success)")
     clips: List[ViralClipGemini] = Field(description="List of viral clip candidates, sorted by virality_score desc")
 
+class GeminiTranscriptSegment(BaseModel):
+    start: float = Field(description="Start time in seconds")
+    duration: float = Field(description="Duration in seconds")
+    text: str = Field(description="Transcribed spoken dialogue text")
+
+class GeminiTranscriptResponse(BaseModel):
+    segments: List[GeminiTranscriptSegment] = Field(description="Chronological list of transcribed speech segments")
+
 # ----------------------------------------------------------------
 # API Request/Response Schemas
 # ----------------------------------------------------------------
@@ -857,10 +865,101 @@ def fetch_transcript_ytdlp(video_id: str, proxy: Optional[str] = None) -> List[d
     return []
 
 
+def fetch_transcript_gemini(video_id: str, gemini_key: str, requested_model: Optional[str] = None) -> List[dict]:
+    """Tier 8 Fallback: Uses Gemini Multimodal Video/Audio Understanding with the user's Gemini API key
+    to ingest the YouTube video directly and transcribe spoken dialogue with timestamps."""
+    if not gemini_key or gemini_key.lower() == "mock":
+        return []
+
+    models_to_try = [
+        requested_model or 'gemini-2.5-flash',
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+        'gemini-1.5-flash',
+        'gemini-2.5-pro'
+    ]
+    models_to_try = list(dict.fromkeys(m for m in models_to_try if m))
+
+    prompt = (
+        "You are an expert audio and video transcriber. Listen carefully to the spoken dialogue in this YouTube video.\n"
+        "Transcribe all spoken sentences with accurate timestamps (in seconds from video start).\n"
+        "Break the speech down into natural, chronological sentence segments.\n"
+        "For each segment provide:\n"
+        "- start: float timestamp in seconds when speech begins\n"
+        "- duration: float duration in seconds of this spoken sentence\n"
+        "- text: exact spoken words\n"
+        "Return all segments chronologically from beginning to end."
+    )
+
+    try:
+        client = genai.Client(api_key=gemini_key)
+        video_part = types.Part.from_uri(
+            file_uri=f"https://www.youtube.com/watch?v={video_id}",
+            mime_type="video/mp4"
+        )
+    except Exception as init_err:
+        logger.warning(f"[Tier 8 Gemini] Client initialization failed: {init_err}")
+        return []
+
+    for model_name in models_to_try:
+        try:
+            logger.info(f"[Tier 8 Gemini AI] Attempting multimodal audio transcription with {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[video_part, prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=GeminiTranscriptResponse,
+                    temperature=0.2
+                )
+            )
+
+            segments = []
+            if getattr(response, 'parsed', None):
+                parsed = response.parsed
+                if hasattr(parsed, 'segments'):
+                    segments = parsed.segments
+            elif getattr(response, 'text', None):
+                cleaned = response.text.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+                    cleaned = re.sub(r"\n?```$", "", cleaned)
+                data = json.loads(cleaned)
+                if isinstance(data, dict):
+                    segments = data.get("segments") or []
+                elif isinstance(data, list):
+                    segments = data
+
+            if segments:
+                result = []
+                for seg in segments:
+                    if isinstance(seg, dict):
+                        st = float(seg.get("start", 0.0))
+                        dur = float(seg.get("duration", 0.0))
+                        txt = str(seg.get("text", "")).strip()
+                    else:
+                        st = float(getattr(seg, "start", 0.0))
+                        dur = float(getattr(seg, "duration", 0.0))
+                        txt = str(getattr(seg, "text", "")).strip()
+                    if txt:
+                        result.append({"start": st, "duration": max(0.5, dur), "text": txt})
+
+                if result:
+                    logger.info(f"[Tier 8 Gemini AI] Successfully generated {len(result)} transcript lines using {model_name}")
+                    return result
+        except Exception as e:
+            logger.warning(f"[Tier 8 Gemini AI] Model {model_name} transcription failed: {e}")
+            continue
+
+    return []
+
+
 def fetch_transcript(
     video_id: str,
     custom_proxy: Optional[str] = None,
-    on_progress: Optional[Callable[[str, str, int], None]] = None
+    on_progress: Optional[Callable[[str, str, int], None]] = None,
+    gemini_key: Optional[str] = None,
+    requested_model: Optional[str] = None
 ) -> List[dict]:
     """Retrieves subtitles using a comprehensive multi-tier fallback pipeline:
       Tier 1: Supadata API (if keys configured) — cloud residential rotation
@@ -870,6 +969,7 @@ def fetch_transcript(
       Tier 5: Direct YouTubeTranscriptApi Python API (Direct, Shared Session + Browser Headers)
       Tier 6: Direct YouTubeTranscriptApi CLI Subprocess (Direct)
       Tier 7: Direct yt-dlp Native Extraction (Direct)
+      Tier 8: Gemini Multimodal Cloud Audio/Video Transcription (using user's Gemini API Key)
     If all tiers fail, raises detailed HTTPException with full diagnostics and solutions.
     """
     def notify(stage: str, detail: str, pct: int):
@@ -1070,6 +1170,21 @@ def fetch_transcript(
         attempt_history.append("Tier 7 (Direct yt-dlp): No subtitle streams found")
     except Exception as ytdlp_err:
         attempt_history.append(f"Tier 7 (Direct yt-dlp): {type(ytdlp_err).__name__} ({str(ytdlp_err)[:150]})")
+
+    # ── Tier 8: Gemini Multimodal Cloud Audio/Video Transcription Fallback ────
+    if gemini_key and gemini_key.lower() != "mock":
+        notify("AI Audio Transcription", "Subtitles unavailable — transcribing video audio via Gemini Multimodal AI...", 96)
+        logger.info("[Tier 8] Subtitles unavailable across Tiers 1-7. Attempting Gemini Multimodal AI transcription...")
+        try:
+            gemini_data = fetch_transcript_gemini(video_id, gemini_key, requested_model)
+            if gemini_data:
+                res = normalize_transcript(gemini_data)
+                if res:
+                    logger.info(f"[Tier 8] Transcript generated via Gemini Multimodal AI: {len(res)} lines")
+                    return res
+            attempt_history.append("Tier 8 (Gemini Multimodal AI): Transcription response was empty")
+        except Exception as gemini_err:
+            attempt_history.append(f"Tier 8 (Gemini Multimodal AI): {type(gemini_err).__name__} ({str(gemini_err)[:150]})")
 
     # ── All Tiers Exhausted: Construct User-Friendly Limit / Quota Error ─────
     combined_history = " ".join(attempt_history)
@@ -1472,7 +1587,7 @@ async def analyze_video(request: AnalyzeRequest):
 
             try:
                 task = asyncio.create_task(
-                    asyncio.to_thread(fetch_transcript, video_id, request.proxy, progress_callback)
+                    asyncio.to_thread(fetch_transcript, video_id, request.proxy, progress_callback, gemini_key, request.model)
                 )
 
                 while not task.done():
