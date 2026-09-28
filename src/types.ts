@@ -34,3 +34,15 @@ export interface AnalyzeResponse {
   transcript?: TranscriptLine[];
   model?: string;
 }
+
+export interface SupadataUsage {
+  total_keys: number;
+  total_limit: number;
+  total_used: number;
+  total_remaining: number;
+  usage_percent: number;
+  active_keys: number;
+  exhausted_keys: number;
+  cached?: boolean;
+}
+

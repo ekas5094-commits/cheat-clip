@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { HeatmapTimeline } from './components/HeatmapTimeline';
 import { LanguageSwitcher } from './components/LanguageSwitcher';
 import { useLanguage } from './locales';
-import type { AnalyzeResponse, ViralClip } from './types';
+import type { AnalyzeResponse, ViralClip, SupadataUsage } from './types';
 
 // Declare YT global variables for TypeScript
 declare global {
@@ -46,6 +46,10 @@ export default function App() {
   const [subtitlesSource, setSubtitlesSource] = useState<'youtube' | 'manual'>('youtube');
   const [manualSubtitlesContent, setManualSubtitlesContent] = useState<string>('');
   const [manualSubtitlesFileName, setManualSubtitlesFileName] = useState<string>('');
+
+  // Supadata quota tracking
+  const [supadataUsage, setSupadataUsage] = useState<SupadataUsage | null>(null);
+  const [loadingSupadataUsage, setLoadingSupadataUsage] = useState<boolean>(false);
 
   const parseTimeToSeconds = (val: string): number | null => {
     const clean = val.trim();
@@ -283,6 +287,26 @@ export default function App() {
   useEffect(() => {
     setExpandedClipIndex(null);
   }, [sortBy, viralityFilter, searchQuery]);
+
+  // Fetch Supadata usage stats for displaying auto-transcript limit status
+  const fetchSupadataUsage = async (refresh = false) => {
+    setLoadingSupadataUsage(true);
+    try {
+      const res = await fetch(`/api/supadata-usage${refresh ? '?refresh=true' : ''}`);
+      if (res.ok) {
+        const data = await res.json();
+        setSupadataUsage(data);
+      }
+    } catch (err) {
+      console.warn('Failed to load Supadata usage:', err);
+    } finally {
+      setLoadingSupadataUsage(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchSupadataUsage();
+  }, []);
 
   const toggleMarkedClip = (clipId: string) => {
     if (!result?.video_id) return;
@@ -921,9 +945,13 @@ export default function App() {
         }
       }, 250);
 
+      // Refresh usage data after analysis
+      fetchSupadataUsage(true);
+
     } catch (err: any) {
       setError(err.message || 'An unexpected error occurred during analysis.');
       setLoading(false);
+      fetchSupadataUsage(true);
     }
   };
 
@@ -1730,9 +1758,83 @@ Transcript:
             </div>
 
             {subtitlesSource === 'youtube' && (
-              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', opacity: 0.8, display: 'block', marginTop: '0.15rem', lineHeight: '1.4' }}>
-                💡 <strong>{t.form.vercelSubtitlesTipTitle}</strong> {t.form.vercelSubtitlesTipDesc} <a href="https://downsub.com/" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--secondary)', textDecoration: 'underline', fontWeight: '500' }}>downsub.com</a> {t.form.andUploadOption}
-              </span>
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.45rem',
+                  padding: '0.65rem 0.85rem',
+                  background: 'rgba(255, 255, 255, 0.03)',
+                  border: '1px solid rgba(255, 255, 255, 0.08)',
+                  borderRadius: '8px',
+                  marginTop: '0.25rem'
+                }}
+              >
+                {/* Small text showing usage limit */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.4rem', fontSize: '0.78rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-secondary)' }}>
+                    <span style={{ fontSize: '0.85rem' }}>📊</span>
+                    {loadingSupadataUsage && !supadataUsage ? (
+                      <span style={{ opacity: 0.7 }}>Loading usage data...</span>
+                    ) : supadataUsage && supadataUsage.total_keys > 0 ? (
+                      <span>
+                        <strong style={{ color: 'var(--text-primary)' }}>
+                          {t.form.autoTranscriptUsage(supadataUsage.total_used, supadataUsage.total_limit, supadataUsage.total_keys)}
+                        </strong>
+                        {' '}({supadataUsage.total_remaining} remaining)
+                      </span>
+                    ) : (
+                      <span style={{ color: '#f59e0b' }}>{t.form.autoTranscriptNoKeys}</span>
+                    )}
+                  </div>
+
+                  {supadataUsage && supadataUsage.total_keys > 0 && (
+                    <span
+                      style={{
+                        fontSize: '0.7rem',
+                        padding: '0.15rem 0.45rem',
+                        borderRadius: '4px',
+                        fontWeight: 600,
+                        background: supadataUsage.total_remaining === 0 ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)',
+                        color: supadataUsage.total_remaining === 0 ? '#ef4444' : '#10b981',
+                        border: `1px solid ${supadataUsage.total_remaining === 0 ? 'rgba(239, 68, 68, 0.3)' : 'rgba(16, 185, 129, 0.3)'}`
+                      }}
+                    >
+                      {supadataUsage.total_remaining === 0 ? t.form.supadataExhaustedBadge : `${supadataUsage.usage_percent}% used`}
+                    </span>
+                  )}
+                </div>
+
+                {/* Warning on quota exhaustion & recommendation for manual upload */}
+                <div style={{ fontSize: '0.75rem', color: '#f59e0b', lineHeight: '1.4', display: 'flex', alignItems: 'flex-start', gap: '0.35rem' }}>
+                  <span style={{ lineHeight: 1, marginTop: '1px' }}>⚠️</span>
+                  <div style={{ flex: 1 }}>
+                    <span>{t.form.autoTranscriptWarning} </span>
+                    <button
+                      type="button"
+                      onClick={() => setSubtitlesSource('manual')}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        padding: 0,
+                        color: 'var(--primary)',
+                        textDecoration: 'underline',
+                        fontWeight: 600,
+                        fontSize: '0.75rem',
+                        cursor: 'pointer',
+                        display: 'inline'
+                      }}
+                    >
+                      {t.form.switchToManualSubtitles} ↗
+                    </button>
+                  </div>
+                </div>
+
+                {/* Helper for downsub.com */}
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', opacity: 0.75, lineHeight: '1.3' }}>
+                  💡 Tip: Download subtitle files (.srt/.txt) for free via <a href="https://downsub.com/" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--secondary)', textDecoration: 'underline' }}>downsub.com</a>.
+                </span>
+              </div>
             )}
           </div>
 

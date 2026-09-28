@@ -1071,40 +1071,46 @@ def fetch_transcript(
     except Exception as ytdlp_err:
         attempt_history.append(f"Tier 7 (Direct yt-dlp): {type(ytdlp_err).__name__} ({str(ytdlp_err)[:150]})")
 
-    # ── All Tiers Exhausted: Construct Comprehensive Diagnostic Error ─────────
+    # ── All Tiers Exhausted: Construct User-Friendly Limit / Quota Error ─────
     combined_history = " ".join(attempt_history)
-    root_cause = []
-    if "TranscriptsDisabled" in combined_history:
-        root_cause.append("Subtitles are disabled for this video by the creator.")
-    elif "AgeRestricted" in combined_history:
-        root_cause.append("Video is age-restricted and requires YouTube authentication.")
-    elif "VideoUnavailable" in combined_history:
-        root_cause.append("Video is private or unavailable.")
-    elif "IpBlocked" in combined_history or "RequestBlocked" in combined_history:
-        root_cause.append("YouTube blocked the IP address (datacenter IP ban / RequestBlocked).")
-
-    error_lines = [
-        f"Unable to retrieve subtitles for YouTube video ID '{video_id}'."
-    ]
-    if root_cause:
-        error_lines.append(f"Probable Cause: {' '.join(root_cause)}")
-
-    error_lines.append("\nMethods attempted and diagnostic results:")
+    
+    # Internal diagnostic log for debugging
+    diag_lines = [f"Unable to retrieve subtitles for YouTube video ID '{video_id}'."]
     for h in attempt_history:
-        error_lines.append(f"  • {h}")
+        diag_lines.append(f"  • {h}")
+    logger.error("Subtitle retrieval exhausted all methods:\n" + "\n".join(diag_lines))
 
-    error_lines.append("\nRecommended solutions:")
-    if not (proxy_cfg or proxy_url):
-        error_lines.append("  1. Configure a proxy in backend/.env (e.g. WEBSHARE_USERNAME & WEBSHARE_PASSWORD, or WEBSHARE_PROXY / PROXY_URL) to bypass datacenter IP bans.")
+    # Construct clean user-facing error message with Supadata usage metrics
+    if "TranscriptsDisabled" in combined_history:
+        user_error = "Subtitles are disabled for this video by the creator. You can upload custom subtitles (.srt or .txt) to analyze this video."
+    elif "AgeRestricted" in combined_history:
+        user_error = "This video is age-restricted and requires YouTube authentication. You can upload custom subtitles (.srt or .txt) to analyze this video."
+    elif "VideoUnavailable" in combined_history:
+        user_error = "This video is private or unavailable."
     else:
-        error_lines.append("  1. Verify your proxy quota/credentials in backend/.env or rotate your residential proxy IP.")
-    if keys:
-        error_lines.append("  2. Check your Supadata API usage or add fresh API keys to SUPADATA_API_KEYS in backend/.env.")
-    error_lines.append("  3. Upload custom subtitles manually (.srt or .txt file) using the 'Upload Custom Subtitle' setting above.")
+        if keys:
+            try:
+                usage = get_supadata_usage_data(force=False)
+                total_used = usage.get("total_used", 0)
+                total_limit = usage.get("total_limit", len(keys) * 100)
+                total_keys = usage.get("total_keys", len(keys))
+                keys_word = "key" if total_keys == 1 else "keys"
+                user_error = (
+                    f"Limit exhausted: {total_used}/{total_limit} Supadata API credits used this month across {total_keys} {keys_word}. "
+                    "Unable to retrieve subtitles automatically. Please upload custom subtitles manually (.srt or .txt) to analyze this video."
+                )
+            except Exception:
+                user_error = (
+                    f"Limit exhausted across {len(keys)} Supadata API keys. "
+                    "Unable to retrieve subtitles automatically. Please upload custom subtitles manually (.srt or .txt) to analyze this video."
+                )
+        else:
+            user_error = (
+                "Limit exhausted: No Supadata API keys configured. "
+                "Unable to retrieve subtitles automatically. Please upload custom subtitles manually (.srt or .txt) to analyze this video."
+            )
 
-    full_error_detail = "\n".join(error_lines)
-    logger.error(f"Subtitle retrieval exhausted all {len(attempt_history)} methods:\n{full_error_detail}")
-    raise HTTPException(status_code=400, detail=full_error_detail)
+    raise HTTPException(status_code=400, detail=user_error)
 
 
 
