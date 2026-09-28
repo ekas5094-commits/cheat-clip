@@ -865,20 +865,27 @@ def fetch_transcript_ytdlp(video_id: str, proxy: Optional[str] = None) -> List[d
     return []
 
 
-def fetch_transcript_gemini(video_id: str, gemini_key: str, requested_model: Optional[str] = None) -> List[dict]:
-    """Tier 8 Fallback: Uses Gemini Multimodal Video/Audio Understanding with the user's Gemini API key
-    to ingest the YouTube video directly and transcribe spoken dialogue with timestamps."""
+def fetch_transcript_gemini(
+    video_id: str,
+    gemini_key: str,
+    requested_model: Optional[str] = None,
+    on_progress: Optional[Callable[[str, str, int], None]] = None
+) -> List[dict]:
+    """Tier 8 Fallback: Uses Gemini Multimodal Video/Audio Understanding with the user's Gemini API key.
+    Uses chat session to eliminate Automatic Function Calling (AFC) warnings, and enforces a strict 25s
+    per-model timeout so that failed/stalled models instantly fall over to the next candidate."""
     if not gemini_key or gemini_key.lower() == "mock":
         return []
 
-    models_to_try = [
+    # Prioritize fastest and most capable Flash models for audio transcription
+    candidate_pool = [
         requested_model or 'gemini-2.5-flash',
         'gemini-2.5-flash',
         'gemini-2.0-flash',
         'gemini-1.5-flash',
-        'gemini-2.5-pro'
+        'gemini-2.5-flash-lite'
     ]
-    models_to_try = list(dict.fromkeys(m for m in models_to_try if m))
+    models_to_try = list(dict.fromkeys(m for m in candidate_pool if m))[:3]
 
     prompt = (
         "You are an expert audio and video transcriber. Listen carefully to the spoken dialogue in this YouTube video.\n"
@@ -901,18 +908,26 @@ def fetch_transcript_gemini(video_id: str, gemini_key: str, requested_model: Opt
         logger.warning(f"[Tier 8 Gemini] Client initialization failed: {init_err}")
         return []
 
-    for model_name in models_to_try:
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=GeminiTranscriptResponse,
+        temperature=0.2
+    )
+
+    for idx, model_name in enumerate(models_to_try):
+        if on_progress:
+            on_progress("AI Audio Transcription", f"Transcribing dialogue with {model_name} (attempt {idx + 1}/{len(models_to_try)})...", 96)
+        logger.info(f"[Tier 8 Gemini AI] Attempting multimodal audio transcription with {model_name} (timeout=25s)...")
+
+        def _call_chat():
+            # Using chat session prevents the Automatic Function Calling (AFC) SDK warning
+            chat = client.chats.create(model=model_name)
+            return chat.send_message(message=[video_part, prompt], config=config)
+
         try:
-            logger.info(f"[Tier 8 Gemini AI] Attempting multimodal audio transcription with {model_name}...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[video_part, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=GeminiTranscriptResponse,
-                    temperature=0.2
-                )
-            )
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_call_chat)
+                response = future.result(timeout=25.0)  # Strict 25s timeout to prevent Vercel 300s cutoff
 
             segments = []
             if getattr(response, 'parsed', None):
@@ -947,8 +962,15 @@ def fetch_transcript_gemini(video_id: str, gemini_key: str, requested_model: Opt
                 if result:
                     logger.info(f"[Tier 8 Gemini AI] Successfully generated {len(result)} transcript lines using {model_name}")
                     return result
+        except TimeoutError:
+            logger.warning(f"[Tier 8 Gemini AI] Model {model_name} timed out after 25s — advancing to next model...")
+            if on_progress and idx + 1 < len(models_to_try):
+                on_progress("AI Model Failover", f"{model_name} timed out. Switching to {models_to_try[idx + 1]}...", 97)
+            continue
         except Exception as e:
-            logger.warning(f"[Tier 8 Gemini AI] Model {model_name} transcription failed: {e}")
+            logger.warning(f"[Tier 8 Gemini AI] Model {model_name} transcription failed: {e} — advancing to next model...")
+            if on_progress and idx + 1 < len(models_to_try):
+                on_progress("AI Model Failover", f"{model_name} failed. Switching to {models_to_try[idx + 1]}...", 97)
             continue
 
     return []
@@ -1176,7 +1198,7 @@ def fetch_transcript(
         notify("AI Audio Transcription", "Subtitles unavailable — transcribing video audio via Gemini Multimodal AI...", 96)
         logger.info("[Tier 8] Subtitles unavailable across Tiers 1-7. Attempting Gemini Multimodal AI transcription...")
         try:
-            gemini_data = fetch_transcript_gemini(video_id, gemini_key, requested_model)
+            gemini_data = fetch_transcript_gemini(video_id, gemini_key, requested_model, on_progress=notify)
             if gemini_data:
                 res = normalize_transcript(gemini_data)
                 if res:
@@ -1949,7 +1971,16 @@ async def analyze_video(request: AnalyzeRequest):
                             "elapsed": elapsed,
                             "message": f"[{model_name} | {elapsed}s] {stage}: {detail}"
                         })
+
+                        if elapsed > 35:
+                            task.cancel()
+                            logger.warning(f"Model {model_name} execution timed out (>35s). Advancing to fallback model...")
+                            last_error = f"{model_name} execution timed out (>35s)"
+                            break
                 
+                if task.cancelled():
+                    continue
+
                 try:
                     resp_candidate = await task
                     last_error = None
