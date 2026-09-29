@@ -476,6 +476,7 @@ def fetch_transcript_cli(
     priority_langs: List[str],
     proxy_url: Optional[str] = None,
     custom_proxy: Optional[str] = None,
+    use_proxy: bool = True,
     timeout: int = 20
 ) -> List[dict]:
     """Attempts subtitle extraction using youtube_transcript_api CLI subprocess.
@@ -489,28 +490,55 @@ def fetch_transcript_cli(
     if priority_langs:
         cmd.extend(["--languages"] + priority_langs)
 
-    ws_user = os.environ.get("WEBSHARE_USERNAME", "").strip()
-    ws_pass = os.environ.get("WEBSHARE_PASSWORD", "").strip()
-    effective_proxy = custom_proxy or proxy_url or get_proxy_url()
+    env = os.environ.copy()
 
-    if ws_user and ws_pass and not custom_proxy:
-        cmd.extend(["--webshare-proxy-username", ws_user, "--webshare-proxy-password", ws_pass])
-    elif effective_proxy:
-        cmd.extend(["--http-proxy", effective_proxy, "--https-proxy", effective_proxy])
+    if use_proxy:
+        ws_user = os.environ.get("WEBSHARE_USERNAME", "").strip()
+        ws_pass = os.environ.get("WEBSHARE_PASSWORD", "").strip()
+        effective_proxy = custom_proxy or proxy_url or get_proxy_url()
 
-    logger.info(f"Executing CLI transcript extraction for {video_id}...")
+        if ws_user and ws_pass and not custom_proxy:
+            cmd.extend(["--webshare-proxy-username", ws_user, "--webshare-proxy-password", ws_pass])
+        elif effective_proxy:
+            cmd.extend(["--http-proxy", effective_proxy, "--https-proxy", effective_proxy])
+    else:
+        # Strip proxy environment variables for pure direct execution
+        for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            env.pop(proxy_var, None)
+
+    logger.info(f"Executing CLI transcript extraction for {video_id} (proxy={'yes' if use_proxy else 'no'})...")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if proc.returncode == 0 and proc.stdout.strip():
-            raw = json.loads(proc.stdout)
-            items = raw[0] if isinstance(raw, list) and len(raw) > 0 and isinstance(raw[0], list) else raw
-            result = normalize_transcript(items)
-            if result:
-                logger.info(f"Transcript fetched via CLI fallback: {len(result)} lines")
-                return result
-        stderr_snippet = (proc.stderr or proc.stdout or "").strip()
-        first_err_line = stderr_snippet.split("\n")[0] if stderr_snippet else f"exit code {proc.returncode}"
-        raise Exception(f"CLI returned {proc.returncode}: {first_err_line}")
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        stdout_clean = (proc.stdout or "").strip()
+        stderr_clean = (proc.stderr or "").strip()
+
+        if proc.returncode == 0 and stdout_clean:
+            # youtube_transcript_api CLI exits with code 0 even when it fails to retrieve transcripts,
+            # printing a plain-text error message to stdout. Check if output is actually JSON.
+            if stdout_clean.startswith(("[", "{")):
+                try:
+                    raw = json.loads(stdout_clean)
+                    items = raw[0] if isinstance(raw, list) and len(raw) > 0 and isinstance(raw[0], list) else raw
+                    result = normalize_transcript(items)
+                    if result:
+                        logger.info(f"Transcript fetched via CLI fallback: {len(result)} lines")
+                        return result
+                except json.JSONDecodeError:
+                    pass
+
+        # Extract the meaningful error message from stdout or stderr
+        output_text = stdout_clean or stderr_clean
+        if output_text:
+            non_empty_lines = [line.strip() for line in output_text.splitlines() if line.strip()]
+            if non_empty_lines:
+                summary_lines = []
+                for line in non_empty_lines:
+                    if "If you are sure" in line or "please create an issue" in line:
+                        break
+                    summary_lines.append(line)
+                first_err = " - ".join(summary_lines[:2])
+                raise Exception(first_err)
+        raise Exception(f"CLI returned exit code {proc.returncode} with no transcript output")
     except Exception as e:
         logger.warning(f"CLI transcript extraction failed: {e}")
         raise
@@ -1074,7 +1102,12 @@ def fetch_transcript(
     # ── Tier 6: Direct YouTubeTranscriptApi CLI Subprocess ────────────────────
     notify("Tier 6/7: Direct CLI Subprocess", "Trying Method 6/7: Direct isolated CLI subprocess...", 88)
     try:
-        direct_cli_data = fetch_transcript_cli(video_id, priority_langs, proxy_url=None, timeout=15)
+        direct_cli_data = fetch_transcript_cli(
+            video_id,
+            priority_langs,
+            use_proxy=False,
+            timeout=15
+        )
         if direct_cli_data:
             logger.info(f"[Tier 6] Transcript fetched via direct CLI subprocess: {len(direct_cli_data)} lines")
             return direct_cli_data
