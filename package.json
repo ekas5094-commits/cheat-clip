@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "concurrently \"npm run dev-frontend\" \"npm run dev-backend\"",
     "dev-frontend": "vite",
-    "dev-backend": "python -m uvicorn backend.main:app --reload --port 8000",
+    "dev-backend": "node scripts/start-backend.js",
+    "update": "node scripts/update.js",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
