@@ -1856,30 +1856,30 @@ async def analyze_video(request: AnalyzeRequest):
                         if not done:
                             elapsed = int(asyncio.get_event_loop().time() - call_start)
                         
-                            if elapsed < 5:
+                            if elapsed < 8:
                                 stage = "Neural Context Loading"
                                 detail = f"Transmitting {len(transcript_dump)} timestamped dialogue segments to {model_name}..."
-                                step_prog = min(35, 12 + elapsed * 4)
-                            elif elapsed < 12:
+                                step_prog = min(35, 12 + elapsed * 3)
+                            elif elapsed < 20:
                                 stage = "Retention Spike Cross-Analysis"
                                 detail = f"Correlating viewer retention peaks against speaker dialogue to isolate viral moments..."
-                                step_prog = min(55, 35 + int((elapsed - 5) * 3))
-                            elif elapsed < 20:
+                                step_prog = min(55, 35 + int((elapsed - 8) * 1.6))
+                            elif elapsed < 40:
                                 stage = "Viral Hook & Curiosity Detection"
                                 detail = f"Scanning transcript dialogue for opening hooks, punchlines, controversial takes & emotional peaks..."
-                                step_prog = min(72, 55 + int((elapsed - 12) * 2.2))
-                            elif elapsed < 30:
+                                step_prog = min(72, 55 + int((elapsed - 20) * 0.85))
+                            elif elapsed < 65:
                                 stage = "Coherence & Sentence Boundary Snapping"
                                 detail = f"Ensuring clip candidates start and end naturally on sentence boundaries without mid-word cuts..."
-                                step_prog = min(85, 72 + int((elapsed - 20) * 1.3))
-                            elif elapsed < 42:
+                                step_prog = min(85, 72 + int((elapsed - 40) * 0.52))
+                            elif elapsed < 80:
                                 stage = "Virality Scoring & Selection"
                                 detail = f"Calculating virality coefficients (1-100) and selecting the top {clip_range} highest potential clips..."
-                                step_prog = min(92, 85 + int((elapsed - 30) * 0.7))
+                                step_prog = min(92, 85 + int((elapsed - 65) * 0.46))
                             else:
                                 stage = "Social Media Metadata Synthesis"
                                 detail = f"Drafting attention-grabbing titles, social captions, and targeted hashtags ({elapsed}s)..."
-                                step_prog = min(95, 92 + min(3, int((elapsed - 42) * 0.3)))
+                                step_prog = min(96, 92 + min(4, int((elapsed - 80) * 0.4)))
 
                             overall_prog = 70 + int(step_prog * 0.28)
                             yield _sse({
@@ -1894,10 +1894,10 @@ async def analyze_video(request: AnalyzeRequest):
                                 "message": f"[{model_name} | {elapsed}s] {stage}: {detail}"
                             })
 
-                            if elapsed > 35:
+                            if elapsed > 90:
                                 task.cancel()
-                                logger.warning(f"Model {model_name} execution timed out (>35s). Advancing to fallback model...")
-                                last_error = f"{model_name} execution timed out (>35s)"
+                                logger.warning(f"Model {model_name} execution timed out (>90s). Advancing to fallback model...")
+                                last_error = f"{model_name} execution timed out (>90s)"
                                 break
                 
                     if task.cancelled():
